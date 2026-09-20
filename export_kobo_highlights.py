@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 # Scriptable's own iCloud container - the widget script (Kobo Quotes.js) reads
 # straight from here, so no cross-app file bookmarking is needed. This folder
@@ -44,10 +46,19 @@ def find_kobo_db() -> Path | None:
     volumes = Path("/Volumes")
     if not volumes.exists():
         return None
-    for volume in volumes.iterdir():
-        candidate = volume / ".kobo" / "KoboReader.sqlite"
-        if candidate.exists():
-            return candidate
+    try:
+        entries = list(volumes.iterdir())
+    except PermissionError:
+        return None
+    for volume in entries:
+        try:
+            candidate = volume / ".kobo" / "KoboReader.sqlite"
+            if candidate.exists():
+                return candidate
+        except PermissionError:
+            # Some mounted volumes (e.g. network shares, Time Machine)
+            # refuse traversal; skip rather than aborting the whole scan.
+            continue
     return None
 
 
@@ -58,44 +69,81 @@ def open_readonly(db_path: Path, retries: int = 5, delay: float = 1.0) -> sqlite
     # Right after the Kobo mounts, the volume can be briefly unready and
     # sqlite3 fails with "unable to open database file" even though the
     # file exists; retrying a few times clears it up.
+    last_error: sqlite3.Error | None = None
     for attempt in range(retries):
         try:
-            return sqlite3.connect(uri, uri=True)
-        except sqlite3.OperationalError:
-            if attempt == retries - 1:
-                raise
-            time.sleep(delay)
+            conn = sqlite3.connect(uri, uri=True)
+            conn.execute("SELECT 1")  # force the file to actually be read
+            return conn
+        except sqlite3.Error as exc:
+            last_error = exc
+            if attempt < retries - 1:
+                time.sleep(delay)
+    sys.exit(f"Could not open Kobo database at {db_path}: {last_error}\n"
+              f"It may still be syncing, or the file may be corrupted.")
 
 
 def fetch_highlights(conn: sqlite3.Connection) -> list[dict]:
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(Bookmark)")
-    columns = {row[1] for row in cur.fetchall()}
 
-    select_cols = ["BookmarkID", "Text", "Annotation", "DateCreated", "VolumeID"]
-    missing = [c for c in select_cols if c not in columns]
+    def table_columns(table: str) -> set[str]:
+        cur.execute("PRAGMA table_info(%s)" % table)
+        return {row[1] for row in cur.fetchall()}
+
+    bookmark_cols = table_columns("Bookmark")
+    if not bookmark_cols:
+        sys.exit("Bookmark table not found in the Kobo database. "
+                  "Kobo firmware may have changed its schema.")
+
+    required = ["BookmarkID", "Text", "Annotation", "DateCreated", "VolumeID"]
+    missing = [c for c in required if c not in bookmark_cols]
     if missing:
         sys.exit(f"Bookmark table is missing expected columns: {missing}. "
                   f"Kobo firmware may have changed its schema.")
 
-    query = """
-        SELECT
-            Bookmark.BookmarkID,
-            Bookmark.Text,
-            Bookmark.Annotation,
-            Bookmark.DateCreated,
-            Bookmark.VolumeID,
-            content.Title,
-            content.Attribution
-        FROM Bookmark
-        LEFT JOIN content ON Bookmark.VolumeID = content.ContentID
-        WHERE Bookmark.Text IS NOT NULL AND TRIM(Bookmark.Text) != ''
-        ORDER BY Bookmark.DateCreated
-    """
-    cur.execute(query)
+    # `content` is joined for title/author but isn't essential; degrade
+    # gracefully instead of crashing if it's absent or reshaped.
+    content_cols = table_columns("content")
+    has_content = {"ContentID", "Title", "Attribution"} <= content_cols
+
+    if has_content:
+        query = """
+            SELECT
+                Bookmark.BookmarkID,
+                Bookmark.Text,
+                Bookmark.Annotation,
+                Bookmark.DateCreated,
+                Bookmark.VolumeID,
+                content.Title,
+                content.Attribution
+            FROM Bookmark
+            LEFT JOIN content ON Bookmark.VolumeID = content.ContentID
+            WHERE Bookmark.Text IS NOT NULL AND TRIM(Bookmark.Text) != ''
+            ORDER BY Bookmark.DateCreated
+        """
+    else:
+        query = """
+            SELECT BookmarkID, Text, Annotation, DateCreated, VolumeID
+            FROM Bookmark
+            WHERE Text IS NOT NULL AND TRIM(Text) != ''
+            ORDER BY DateCreated
+        """
+
+    try:
+        cur.execute(query)
+        rows = cur.fetchall()
+    except sqlite3.DatabaseError as exc:
+        sys.exit(f"Failed to read highlights from the Kobo database: {exc}")
 
     quotes = []
-    for bookmark_id, text, annotation, date_created, volume_id, title, author in cur.fetchall():
+    for row in rows:
+        if has_content:
+            bookmark_id, text, annotation, date_created, volume_id, title, author = row
+        else:
+            bookmark_id, text, annotation, date_created, volume_id = row
+            title = author = None
+        if not bookmark_id or not text or not text.strip():
+            continue  # skip malformed rows rather than writing unusable quotes
         quotes.append({
             "id": bookmark_id,
             "text": text.strip(),
@@ -108,20 +156,57 @@ def fetch_highlights(conn: sqlite3.Connection) -> list[dict]:
     return quotes
 
 
+def _quarantine_corrupt_file(path: Path) -> None:
+    """Move an unreadable file aside instead of silently discarding it, so
+    the user can inspect or recover it later."""
+    backup = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
+    try:
+        path.rename(backup)
+        print(f"Warning: {path} was unreadable; moved it to {backup} and starting fresh.",
+              file=sys.stderr)
+    except OSError as exc:
+        print(f"Warning: {path} was unreadable and couldn't be backed up ({exc}); "
+              f"starting fresh.", file=sys.stderr)
+
+
 def load_whitelist(path: Path) -> dict:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        print(f"Warning: could not read whitelist at {path}: {exc}", file=sys.stderr)
+        _quarantine_corrupt_file(path)
+        return {}
+    if not isinstance(data, dict):
+        print(f"Warning: whitelist at {path} was not a JSON object; ignoring it.",
+              file=sys.stderr)
+        _quarantine_corrupt_file(path)
+        return {}
+
+    cleaned = {}
+    for vid, info in data.items():
+        if (
+            isinstance(info, dict)
+            and info.get("decision") in ("approved", "rejected")
+        ):
+            cleaned[vid] = info
+        else:
+            print(f"Warning: dropping malformed whitelist entry for {vid!r}; "
+                  f"it will be asked about again.", file=sys.stderr)
+    return cleaned
 
 
 def save_whitelist(path: Path, whitelist: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(whitelist, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_atomic(path, whitelist)
 
 
-def resolve_whitelist(fresh: list[dict], whitelist: dict) -> None:
+def resolve_whitelist(fresh: list[dict], whitelist: dict, assume_no: bool = False) -> None:
     """Prompt for any book not yet decided. Mutates `whitelist` in place so
-    partial progress is kept even if the user bails out partway through."""
+    partial progress is kept even if the user bails out partway through.
+
+    If stdin isn't a TTY (e.g. run from cron/launchd) or `assume_no` is set,
+    undecided books are left pending rather than blocking on input()."""
     books = {}
     order = []
     for q in fresh:
@@ -131,9 +216,17 @@ def resolve_whitelist(fresh: list[dict], whitelist: dict) -> None:
             order.append(vid)
         books[vid]["count"] += 1
 
-    for vid in order:
-        if vid in whitelist:
-            continue
+    pending = [vid for vid in order if vid not in whitelist]
+    if not pending:
+        return
+
+    if assume_no or not sys.stdin.isatty():
+        print(f"{len(pending)} new book(s) found but running non-interactively; "
+              f"leaving them undecided (re-run interactively to approve them).",
+              file=sys.stderr)
+        return
+
+    for vid in pending:
         info = books[vid]
         author = f" by {info['author']}" if info["author"] else ""
         n = info["count"]
@@ -157,20 +250,45 @@ def resolve_whitelist(fresh: list[dict], whitelist: dict) -> None:
 
 
 def merge(existing: list[dict], fresh: list[dict]) -> list[dict]:
-    by_id = {q["id"]: q for q in existing}
+    by_id = {q["id"]: q for q in existing if isinstance(q, dict) and "id" in q}
     for q in fresh:
         by_id[q["id"]] = q  # fresh data wins if a highlight was edited on-device
-    return sorted(by_id.values(), key=lambda q: q["date"] or "")
+    return sorted(by_id.values(), key=lambda q: q.get("date") or "")
 
 
-def write_atomic(path: Path, data: list[dict]) -> None:
+def load_existing_quotes(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        print(f"Warning: could not read existing output at {path}: {exc}", file=sys.stderr)
+        _quarantine_corrupt_file(path)
+        return []
+    if not isinstance(data, list):
+        print(f"Warning: existing output at {path} was not a JSON array; ignoring it.",
+              file=sys.stderr)
+        _quarantine_corrupt_file(path)
+        return []
+    return data
+
+
+def write_atomic(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, delete=False, suffix=".tmp", encoding="utf-8"
-    ) as tmp:
-        json.dump(data, tmp, ensure_ascii=False, indent=2)
-        tmp_path = Path(tmp.name)
-    tmp_path.replace(path)  # atomic on the same filesystem
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, delete=False, suffix=".tmp", encoding="utf-8"
+        ) as tmp:
+            json.dump(data, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(path)  # atomic on the same filesystem
+    except OSError:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def main() -> None:
@@ -181,6 +299,9 @@ def main() -> None:
                          help=f"Output JSON path (default: {DEFAULT_OUT})")
     parser.add_argument("--whitelist", type=Path, default=DEFAULT_WHITELIST,
                          help=f"Book whitelist JSON path (default: {DEFAULT_WHITELIST})")
+    parser.add_argument("--non-interactive", action="store_true",
+                         help="Never prompt for new books (e.g. when run from cron/launchd); "
+                              "undecided books are left pending for a future interactive run.")
     args = parser.parse_args()
 
     db_path = args.db or find_kobo_db()
@@ -189,17 +310,24 @@ def main() -> None:
                   "or pass --db explicitly.")
     if not db_path.exists():
         sys.exit(f"No such file: {db_path}")
+    if not os.access(db_path, os.R_OK):
+        sys.exit(f"No permission to read {db_path}.")
 
     # sqlite3 needs a real path (not a Path object) inside the URI.
     conn = open_readonly(db_path)
     try:
         fresh = fetch_highlights(conn)
+    except sqlite3.Error as exc:
+        sys.exit(f"Failed to read the Kobo database: {exc}")
     finally:
         conn.close()
 
     whitelist = load_whitelist(args.whitelist)
-    resolve_whitelist(fresh, whitelist)
-    save_whitelist(args.whitelist, whitelist)
+    resolve_whitelist(fresh, whitelist, assume_no=args.non_interactive)
+    try:
+        save_whitelist(args.whitelist, whitelist)
+    except OSError as exc:
+        sys.exit(f"Failed to save whitelist to {args.whitelist}: {exc}")
 
     approved_ids = {vid for vid, info in whitelist.items() if info["decision"] == "approved"}
     fresh_approved = [
@@ -207,12 +335,12 @@ def main() -> None:
         for q in fresh if q["volume_id"] in approved_ids
     ]
 
-    existing = []
-    if args.out.exists():
-        existing = json.loads(args.out.read_text(encoding="utf-8"))
-
+    existing = load_existing_quotes(args.out)
     combined = merge(existing, fresh_approved)
-    write_atomic(args.out, combined)
+    try:
+        write_atomic(args.out, combined)
+    except OSError as exc:
+        sys.exit(f"Failed to write output to {args.out}: {exc}")
 
     pending = {q["volume_id"] for q in fresh} - set(whitelist)
     print(f"Read {len(fresh)} highlights from {db_path}")
@@ -223,4 +351,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\nInterrupted.")

@@ -2,23 +2,52 @@
 // icon-color: deep-purple; icon-glyph: quote-right;
 
 async function main() {
-  const fm = FileManager.iCloud();
-  const path = fm.joinPath(fm.documentsDirectory(), "quotes.json");
+  try {
+    const fm = FileManager.iCloud();
+    const path = fm.joinPath(fm.documentsDirectory(), "quotes.json");
 
-  if (!fm.fileExists(path)) {
-    return buildWidget("No quotes.json yet — run the export script on your Mac.");
-  }
-  if (!fm.isFileDownloaded(path)) {
-    await fm.downloadFileFromiCloud(path);
-  }
+    if (!fm.fileExists(path)) {
+      return buildWidget("No quotes.json yet — run the export script on your Mac.");
+    }
 
-  const quotes = JSON.parse(fm.readString(path));
-  if (!quotes || quotes.length === 0) {
-    return buildWidget("No highlights found yet.");
-  }
+    if (!fm.isFileDownloaded(path)) {
+      try {
+        await fm.downloadFileFromiCloud(path);
+      } catch (e) {
+        return buildWidget("Couldn't download quotes.json from iCloud. Try again later.");
+      }
+    }
 
-  const quote = quotes[Math.floor(Math.random() * quotes.length)];
-  return buildWidget(quote.text, quote.note, quote.book, quote.author);
+    let raw;
+    try {
+      raw = fm.readString(path);
+    } catch (e) {
+      return buildWidget("Couldn't read quotes.json.");
+    }
+
+    let quotes;
+    try {
+      quotes = JSON.parse(raw);
+    } catch (e) {
+      return buildWidget("quotes.json is corrupted — re-run the export script.");
+    }
+
+    if (!Array.isArray(quotes) || quotes.length === 0) {
+      return buildWidget("No highlights found yet.");
+    }
+
+    const usable = quotes.filter(
+      (q) => q && typeof q.text === "string" && q.text.trim() !== ""
+    );
+    if (usable.length === 0) {
+      return buildWidget("No usable highlights found yet.");
+    }
+
+    const quote = usable[Math.floor(Math.random() * usable.length)];
+    return buildWidget(quote.text, quote.note, quote.book, quote.author);
+  } catch (e) {
+    return buildWidget("Something went wrong loading quotes.");
+  }
 }
 
 function buildWidget(text, note, book, author) {
